@@ -15,30 +15,72 @@ room_users = {}
 load_dotenv()
 
 # --- UTILITY FUNCTION: Safe JSON Parser ---
+def extract_json_from_response(response_text: str) -> str:
+    """
+    Safely extracts JSON from a fenced or raw LLM response.
+
+    Handles:
+    - ```json ... ``` blocks
+    - ``` ... ``` blocks without language tag
+    - Raw JSON responses with no fencing
+    - Trailing assistant text after closing fence
+
+    Args:
+        response_text (str): Raw response string from the LLM.
+
+    Returns:
+        str: Clean JSON string ready for json.loads().
+
+    Raises:
+        ValueError: If no valid JSON block can be extracted.
+    """
+    # Try extracting from fenced block first
+    match = re.search(
+        r"```json\s*([\s\S]*?)\s*```",
+        response_text,
+        re.IGNORECASE
+    )
+
+    # Fallback to any fenced block
+    if not match:
+        match = re.search(
+            r"```\s*([\s\S]*?)\s*```",
+            response_text
+        )
+    if match:
+        return match.group(1).strip()  
+    
+    # Fallback: attempt to use raw response as JSON
+    stripped = response_text.strip()
+    if stripped.startswith("{") or stripped.startswith("["):
+        return stripped
+    
+    raise ValueError("No valid JSON block found in LLM response.")
+
 def parse_json_response(response_text: str):
     """
-    Safely parse JSON from LLM response, handling markdown code blocks.
+    Safely parses JSON from LLM response using extract_json_from_response.
     
-    Only unwraps if the ENTIRE response is a fenced block to avoid breaking
-    valid JSON that contains backticks in field values (e.g., code_snippet).
-    
-    Handles cases like:
-    - ```json\n{...}\n```
-    - ```\n{...}\n```
-    - {raw JSON with "field": "```code```"}
+    Args:
+        response_text (str): Raw response string from the LLM.
+
+    Returns:
+        dict: Parsed JSON object.
     """
-    response_text = response_text.strip()
-    
-    # Only unwrap if the entire response is wrapped in backticks
-    # This prevents breaking JSON with backticks in field values
-    if response_text.startswith('```') and response_text.endswith('```'):
-        # Remove opening fence and any optional Markdown info string (json, JSON, js, etc.)
-        response_text = re.sub(r'^```[^\n]*\n?', '', response_text)
-        # Remove closing fence (```)
-        response_text = re.sub(r'\s*```$', '', response_text)
-        response_text = response_text.strip()
-    
-    return json.loads(response_text)
+    try:
+        clean_text = extract_json_from_response(response_text)
+    except ValueError as e:
+        # If extraction fails completely, fallback to trying the whole string
+        clean_text = response_text
+
+    try:
+        return json.loads(clean_text, strict=False)
+    except json.JSONDecodeError as e:
+        print(f"⚠️ JSON Parse Error: {e}. Applying regex fallback for invalid escapes...")
+        # Clean up invalid backslash escapes that break json.loads
+        # Matches a backslash NOT preceded by a backslash, and NOT followed by a valid JSON escape char
+        cleaned_text = re.sub(r'(?<!\\)\\(?!["\\/bfnrtu])', r'\\\\', clean_text)
+        return json.loads(cleaned_text, strict=False)
 
 # --- 1. SETUP API KEY ---
 GENAI_KEY = os.getenv("GEMINI_API_KEY")
@@ -52,6 +94,12 @@ else:
 # --- 2. SELF-HEALING MODEL SELECTOR ---
 # This function asks Google what models are actually valid right now.
 def get_valid_models():
+    """
+    Scans and returns available generative AI models.
+
+    Returns:
+        list: A sorted list of available model names prioritizing newer models.
+    """
     valid_models = []
     try:
         print("🔍 Scanning for available AI models...")
@@ -116,6 +164,19 @@ class CodeRequest(BaseModel):
     language: str
 
 def get_smart_response(prompt_text, use_json=False):
+    """
+    Generates a response from the LLM based on the prompt.
+
+    Args:
+        prompt_text (str): The prompt to send to the LLM.
+        use_json (bool): Whether to enforce JSON response formatting.
+
+    Returns:
+        str: The raw text response from the LLM.
+        
+    Raises:
+        HTTPException: If all models fail to generate a response.
+    """
     if not GENAI_KEY or GENAI_KEY == "missing" or not GENAI_KEY.strip():
         raise HTTPException(
             status_code=401,
@@ -190,10 +251,30 @@ def get_smart_response(prompt_text, use_json=False):
 
 @app.get("/")
 def health_check():
+    """
+    Checks the health of the API and returns available models.
+
+    Returns:
+        dict: A dictionary containing status and models.
+    """
     return {"status": "Online", "models": AVAILABLE_MODELS}
 
 @app.post("/generate")
 async def generate_graph(request: GraphRequest):
+    """
+    Generates a structured graph layout JSON based on a prompt.
+
+    Args:
+        request (GraphRequest): The request containing the user's prompt.
+
+    Returns:
+        dict: The parsed JSON object representing nodes and edges.
+        
+    Raises:
+        HTTPException: If the API key is missing or generation fails.
+    """
+    if not GENAI_KEY:
+        raise HTTPException(status_code=500, detail="API Key missing on Render.")
     if not GENAI_KEY or GENAI_KEY == "missing" or not GENAI_KEY.strip():
         raise HTTPException(
             status_code=401,
@@ -213,6 +294,9 @@ async def generate_graph(request: GraphRequest):
       "nodes": [{"id": "1", "label": "Start"}],
       "edges": [{"source": "1", "target": "2", "label": "next"}]
     }
+    
+    IMPORTANT: You MUST return perfectly valid JSON. 
+    All backslashes in code_snippet or strings MUST be properly double-escaped (e.g. \\n, \\t).
     """
     try:
         response_text = get_smart_response(f"{system_prompt}\n\nUSER PROMPT: {request.prompt}", use_json=True)
@@ -232,6 +316,18 @@ async def generate_graph(request: GraphRequest):
 
 @app.post("/chat")
 async def chat_with_ai(request: ChatRequest):
+    """
+    Processes a chat message given the graph context.
+
+    Args:
+        request (ChatRequest): The request containing message and context.
+
+    Returns:
+        dict: A dictionary with the AI's reply.
+        
+    Raises:
+        HTTPException: If generation fails.
+    """
     try:
         response_text = get_smart_response(f"Context: {request.context}\nUser: {request.message}", use_json=False)
         return {"reply": response_text}
@@ -242,6 +338,18 @@ async def chat_with_ai(request: ChatRequest):
 
 @app.post("/regenerate_code")
 async def regenerate_code(request: CodeRequest):
+    """
+    Regenerates the code snippet into a specified programming language.
+
+    Args:
+        request (CodeRequest): The request containing prompt and language.
+
+    Returns:
+        dict: A dictionary with the new code snippet and explanation.
+        
+    Raises:
+        HTTPException: If generation fails.
+    """
     try:
         response_text = get_smart_response(f"Convert: {request.prompt} to {request.language}. Return ONLY code.", use_json=False)
         return {"code_snippet": response_text.replace("```",""), "code_explanation": f"Converted to {request.language}"}
